@@ -1,0 +1,1428 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot, collection, query, where, updateDoc, arrayUnion, serverTimestamp, getDoc, runTransaction, orderBy } from 'firebase/firestore';
+
+// --- CONFIGURATION & UTILITIES ---
+
+// Global Firebase variables provided by the environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// The investment plan structure (hardcoded constants)
+const INVESTMENT_PLANS = [
+  { id: 'M1', name: 'Machine 1', investAmount: 3000, durationDays: 2, payoutAmount: 5000, icon: '⚡' },
+  { id: 'M2', name: 'Machine 2', investAmount: 5000, durationDays: 5, payoutAmount: 15000, icon: '💰' },
+  { id: 'M3', name: 'Machine 3', investAmount: 13000, durationDays: 9, payoutAmount: 23300, icon: '📈' },
+  { id: 'M4', name: 'Machine 4', investAmount: 15000, durationDays: 12, payoutAmount: 30000, icon: '💎' },
+];
+
+// Colors and Styling
+const PRIMARY_NAVY = '#0b2545';
+const SECONDARY_GREEN = '#00b894';
+
+// Formatting utility for Nigerian Naira
+const formatNaira = (amount) => {
+  return new Intl.NumberFormat('en-NG', { style: 'currency', currency: 'NGN' }).format(amount);
+};
+
+// Icon components (using simple characters or inline SVG replacements for lucide-react)
+const WalletIcon = ({ className = "w-5 h-5" }) => <span className={className}>💳</span>;
+const HomeIcon = ({ className = "w-5 h-5" }) => <span className={className}>🏠</span>;
+const DepositIcon = ({ className = "w-5 h-5" }) => <span className={className}>⬆️</span>;
+const WithdrawIcon = ({ className = "w-5 h-5" }) => <span className={className}>⬇️</span>;
+const ReferralIcon = ({ className = "w-5 h-5" }) => <span className={className}>🤝</span>;
+const CheckInIcon = ({ className = "w-5 h-5" }) => <span className={className}>✅</span>;
+const PlanIcon = ({ className = "w-5 h-5" }) => <span className={className}>⚙️</span>;
+
+// --- FIREBASE INITIALIZATION AND CONTEXT ---
+
+let app, db, auth;
+let isFirebaseInitialized = false;
+
+// Custom hook for Firebase initialization and Auth state
+const useFirebaseAndAuth = () => {
+  const [authState, setAuthState] = useState({
+    isAuthenticated: false,
+    loading: true,
+    userId: null,
+    userEmail: null,
+  });
+
+  useEffect(() => {
+    if (isFirebaseInitialized) return;
+
+    try {
+      app = initializeApp(firebaseConfig);
+      db = getFirestore(app);
+      auth = getAuth(app);
+      isFirebaseInitialized = true;
+      console.log('Firebase initialized.');
+
+      const signInPromise = initialAuthToken
+        ? signInWithCustomToken(auth, initialAuthToken)
+        : signInAnonymously(auth);
+
+      signInPromise
+        .then(() => console.log("Signed in successfully."))
+        .catch(error => {
+          console.error("Authentication failed:", error);
+        });
+
+      // Set up Auth state listener
+      const unsubscribe = onAuthStateChanged(auth, (user) => {
+        if (user) {
+          setAuthState({
+            isAuthenticated: true,
+            loading: false,
+            userId: user.uid,
+            userEmail: user.email,
+          });
+        } else {
+          setAuthState({
+            isAuthenticated: false,
+            loading: false,
+            userId: null,
+            userEmail: null,
+          });
+        }
+      });
+
+      return () => unsubscribe();
+    } catch (e) {
+      console.error("Failed to initialize Firebase:", e);
+      setAuthState(prev => ({ ...prev, loading: false }));
+    }
+  }, []);
+
+  return { authState, db, auth };
+};
+
+// Custom hook to fetch and manage user data in real-time
+const useUserData = (userId, db) => {
+  const [userData, setUserData] = useState({
+    walletBalance: 0,
+    referralBonus: 0,
+    lastCheckIn: 0,
+    referralCode: '',
+    fullName: '',
+  });
+  const [investments, setInvestments] = useState([]);
+  const [transactions, setTransactions] = useState([]);
+  const [loadingData, setLoadingData] = useState(true);
+
+  // 1. Fetch User Profile Data
+  useEffect(() => {
+    if (!userId || !db) return;
+
+    const userDocRef = doc(db, 'artifacts', appId, 'users', userId, 'profile', 'data');
+    const unsubscribe = onSnapshot(userDocRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setUserData({
+          walletBalance: data.walletBalance || 0,
+          referralBonus: data.referralBonus || 0,
+          lastCheckIn: data.lastCheckIn?.toMillis() || 0,
+          referralCode: data.referralCode || userId.substring(0, 8),
+          fullName: data.fullName || 'User',
+        });
+      } else {
+        // Initialize new user data
+        const initialData = {
+          walletBalance: 0,
+          referralBonus: 0,
+          lastCheckIn: 0,
+          referralCode: userId.substring(0, 8),
+          fullName: `User-${userId.substring(0, 4)}`,
+          createdAt: serverTimestamp(),
+        };
+        setDoc(userDocRef, initialData, { merge: true })
+          .then(() => console.log("New user initialized."))
+          .catch(e => console.error("Error initializing user:", e));
+        setUserData(initialData);
+      }
+      setLoadingData(false);
+    }, (error) => {
+      console.error("Error listening to user data:", error);
+      setLoadingData(false);
+    });
+
+    return () => unsubscribe();
+  }, [userId, db]);
+
+  // 2. Fetch Investments
+  useEffect(() => {
+    if (!userId || !db) return;
+
+    const investmentsColRef = collection(db, 'artifacts', appId, 'users', userId, 'investments');
+    const q = query(investmentsColRef, orderBy('startedAt', 'desc'));
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const activeInvestments = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        // Convert Firestore Timestamps to JS Dates/Numbers
+        startedAt: doc.data().startedAt?.toDate(),
+        endsAt: doc.data().endsAt?.toDate(),
+      }));
+      setInvestments(activeInvestments);
+    }, (error) => {
+      console.error("Error listening to investments:", error);
+    });
+
+    return () => unsubscribe();
+  }, [userId, db]);
+
+  // 3. Fetch Transactions
+  useEffect(() => {
+    if (!userId || !db) return;
+
+    const transactionsColRef = collection(db, 'artifacts', appId, 'users', userId, 'transactions');
+    const q = query(transactionsColRef, orderBy('created_at', 'desc'));
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const fetchedTransactions = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        created_at: doc.data().created_at?.toDate(),
+      }));
+      setTransactions(fetchedTransactions);
+    }, (error) => {
+      console.error("Error listening to transactions:", error);
+    });
+
+    return () => unsubscribe();
+  }, [userId, db]);
+
+  return { userData, investments, transactions, loadingData };
+};
+
+// --- CORE BUSINESS LOGIC (CLIENT-SIDE SIMULATION) ---
+
+/**
+ * Executes a simulated payment and creates an investment record.
+ * This function simulates the server-side transactional logic.
+ * @param {object} plan - The selected investment plan.
+ * @param {string} userId - The current user ID.
+ * @param {object} db - Firestore instance.
+ * @param {number} currentBalance - Current wallet balance for validation.
+ * @returns {Promise<boolean>} Success status.
+ */
+const executeInvestmentTransaction = async (plan, userId, db, currentBalance) => {
+  if (currentBalance < plan.investAmount) {
+    console.error('Insufficient balance.');
+    return false;
+  }
+
+  const userDocRef = doc(db, 'artifacts', appId, 'users', userId, 'profile', 'data');
+  const investmentsColRef = collection(db, 'artifacts', appId, 'users', userId, 'investments');
+  const transactionsColRef = collection(db, 'artifacts', appId, 'users', userId, 'transactions');
+
+  try {
+    await runTransaction(db, async (transaction) => {
+      const userDoc = await transaction.get(userDocRef);
+      if (!userDoc.exists()) {
+        throw "User document does not exist!";
+      }
+
+      const newBalance = (userDoc.data().walletBalance || 0) - plan.investAmount;
+      if (newBalance < 0) {
+        throw "Insufficient funds detected during transaction.";
+      }
+
+      // 1. Update Wallet Balance (Debit)
+      transaction.update(userDocRef, {
+        walletBalance: newBalance,
+      });
+
+      // 2. Create Investment Record
+      const endDate = new Date();
+      endDate.setDate(endDate.getDate() + plan.durationDays);
+      const newInvestment = {
+        userId: userId,
+        planId: plan.id,
+        amount: plan.investAmount,
+        expectedPayout: plan.payoutAmount,
+        status: 'active',
+        startedAt: serverTimestamp(),
+        endsAt: endDate,
+        payoutPaid: false,
+        planName: plan.name,
+        created_at: serverTimestamp(),
+      };
+      // Firestore will auto-generate an ID for the new document
+      await setDoc(doc(investmentsColRef), newInvestment);
+
+      // 3. Create Transaction Record (Investment Debit)
+      const investmentTransaction = {
+        userId: userId,
+        type: 'investment_debit',
+        amount: -plan.investAmount,
+        status: 'completed',
+        reference: `INV-${Date.now()}`,
+        description: `Investment in ${plan.name}`,
+        created_at: serverTimestamp(),
+      };
+      await setDoc(doc(transactionsColRef), investmentTransaction);
+
+      // 4. (SIMULATION) Check for Referrer and Credit Referral Bonus
+      // In a real app, this logic would live server-side, triggered by the investment completion.
+      const referredBy = userDoc.data().referredBy;
+      if (referredBy) {
+        // Fetch referrer's profile doc (assuming referredBy holds the referrer's userId)
+        const referrerDocRef = doc(db, 'artifacts', appId, 'users', referredBy, 'profile', 'data');
+
+        // Fetch the referee's referral status for this investment (Simulation: check if already credited for *any* investment)
+        // For simplicity, we only credit the referrer once per referee investment (simulated here)
+        const referralLogRef = doc(db, 'artifacts', appId, 'users', referredBy, 'referrals', userId);
+        const referralLog = await transaction.get(referralLogRef);
+
+        if (!referralLog.exists() || referralLog.data().status === 'registered') {
+          const REFERRAL_BONUS = 3000;
+
+          // 4a. Credit Referrer's Wallet
+          const referrerDoc = await transaction.get(referrerDocRef);
+          if (referrerDoc.exists()) {
+            const newReferrerBalance = (referrerDoc.data().referralBonus || 0) + REFERRAL_BONUS;
+            transaction.update(referrerDocRef, {
+              referralBonus: newReferrerBalance,
+            });
+
+            // 4b. Create Transaction Record for Referrer
+            const referralTransaction = {
+              userId: referredBy,
+              type: 'referral_credit',
+              amount: REFERRAL_BONUS,
+              status: 'completed',
+              reference: `REF-${Date.now()}`,
+              description: `Bonus from ${userDoc.data().fullName || 'new user'} investment.`,
+              created_at: serverTimestamp(),
+            };
+            await setDoc(doc(collection(db, 'artifacts', appId, 'users', referredBy, 'transactions')), referralTransaction);
+
+            // 4c. Update Referral Log Status
+            transaction.set(referralLogRef, {
+              referrerId: referredBy,
+              refereeId: userId,
+              status: 'credited',
+              creditedAmount: REFERRAL_BONUS,
+              creditedAt: serverTimestamp(),
+            }, { merge: true });
+          }
+        }
+      }
+
+    });
+    return true;
+  } catch (e) {
+    console.error("Investment Transaction failed:", e);
+    alert(`Investment failed: ${e.message || e}. Check console for details.`);
+    return false;
+  }
+};
+
+/**
+ * Handles the logic for crediting matured investments.
+ * This runs continuously to simulate a server-side cron job.
+ */
+const useInvestmentPayouts = (userId, db, investments) => {
+  useEffect(() => {
+    if (!userId || !db || investments.length === 0) return;
+
+    const checkPayouts = async () => {
+      const now = new Date();
+      for (const inv of investments) {
+        if (inv.status === 'active' && inv.endsAt && inv.endsAt.getTime() <= now.getTime() && !inv.payoutPaid) {
+          console.log(`Matured investment found: ${inv.id}. Processing payout...`);
+
+          const investmentDocRef = doc(db, 'artifacts', appId, 'users', userId, 'investments', inv.id);
+          const userDocRef = doc(db, 'artifacts', appId, 'users', userId, 'profile', 'data');
+          const transactionsColRef = collection(db, 'artifacts', appId, 'users', userId, 'transactions');
+
+          try {
+            await runTransaction(db, async (transaction) => {
+              const userDoc = await transaction.get(userDocRef);
+
+              // 1. Credit Wallet Balance
+              const currentBalance = userDoc.data().walletBalance || 0;
+              const newBalance = currentBalance + inv.expectedPayout;
+              transaction.update(userDocRef, { walletBalance: newBalance });
+
+              // 2. Mark Investment as Paid
+              transaction.update(investmentDocRef, {
+                status: 'completed',
+                payoutPaid: true,
+                completedAt: serverTimestamp(),
+              });
+
+              // 3. Create Payout Transaction Record
+              const payoutTransaction = {
+                userId: userId,
+                type: 'payout_credit',
+                amount: inv.expectedPayout,
+                status: 'completed',
+                reference: `PAYOUT-${Date.now()}-${inv.id.substring(0, 4)}`,
+                description: `Payout from ${inv.planName} investment.`,
+                created_at: serverTimestamp(),
+              };
+              await setDoc(doc(transactionsColRef), payoutTransaction);
+            });
+            console.log(`Payout successful for investment ${inv.id}.`);
+          } catch (e) {
+            console.error(`Payout transaction failed for ${inv.id}:`, e);
+          }
+        }
+      }
+    };
+
+    // Run check immediately and then every minute (simulating a cron job)
+    checkPayouts();
+    const intervalId = setInterval(checkPayouts, 60000); // Check every minute
+
+    return () => clearInterval(intervalId); // Cleanup
+  }, [userId, db, investments]);
+};
+
+// --- COMPONENTS ---
+
+const Header = ({ onNavigate, isAuthenticated, fullName }) => {
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const NavItem = ({ name, icon: Icon, target }) => (
+    <button
+      onClick={() => { onNavigate(target); setIsMenuOpen(false); }}
+      className="flex items-center space-x-2 p-2 text-white hover:bg-white/10 transition duration-150 rounded-lg w-full text-left"
+    >
+      <Icon className="w-5 h-5 text-green-300" />
+      <span>{name}</span>
+    </button>
+  );
+
+  return (
+    <header className={`sticky top-0 z-50 shadow-lg ${isAuthenticated ? 'bg-white' : 'bg-transparent'}`}>
+      <div className={`max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex justify-between items-center h-16 ${isAuthenticated ? 'text-gray-900' : 'text-white'}`}>
+        <h1 className="text-xl font-bold tracking-tight">Grow Wealth Investment</h1>
+
+        {isAuthenticated ? (
+          <>
+            <div className="hidden md:flex space-x-4 font-medium">
+              <button onClick={() => onNavigate('Dashboard')} className="hover:text-gray-600 transition">Dashboard</button>
+              <button onClick={() => onNavigate('Plans')} className="hover:text-gray-600 transition">Plans</button>
+              <button onClick={() => onNavigate('Referral')} className="hover:text-gray-600 transition">Referral</button>
+              <button onClick={() => onNavigate('Transactions')} className="hover:text-gray-600 transition">Activity</button>
+            </div>
+            <div className="flex items-center space-x-3">
+              <span className="text-sm font-semibold hidden sm:inline">Welcome, {fullName.split(' ')[0]}</span>
+              <button
+                onClick={() => setIsMenuOpen(!isMenuOpen)}
+                className="p-2 md:hidden"
+              >
+                {isMenuOpen ? '✕' : '☰'}
+              </button>
+            </div>
+          </>
+        ) : (
+          <div className="hidden md:flex space-x-4">
+            <button onClick={() => onNavigate('Login')} className={`px-4 py-2 font-semibold border-2 rounded-full transition duration-300 ${onNavigate === 'Login' ? 'border-white bg-white text-navy' : 'border-white text-white hover:bg-white hover:text-navy'}`}>
+              Login
+            </button>
+            <button onClick={() => onNavigate('Register')} className="px-4 py-2 bg-white text-navy font-semibold rounded-full hover:bg-gray-100 transition duration-300">
+              Register
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Mobile Drawer */}
+      {isAuthenticated && isMenuOpen && (
+        <div className="md:hidden absolute top-16 left-0 right-0 bg-navy p-4 shadow-xl">
+          <NavItem name="Dashboard" icon={HomeIcon} target="Dashboard" />
+          <NavItem name="Investment Plans" icon={PlanIcon} target="Plans" />
+          <NavItem name="Referral Program" icon={ReferralIcon} target="Referral" />
+          <NavItem name="Activity Feed" icon={WalletIcon} target="Transactions" />
+          <hr className="my-2 border-gray-700" />
+          <button
+            onClick={() => auth.signOut().then(() => onNavigate('Landing'))}
+            className="flex items-center space-x-2 p-2 text-red-400 hover:bg-white/10 transition duration-150 rounded-lg w-full text-left"
+          >
+            <span>Logout</span>
+          </button>
+        </div>
+      )}
+    </header>
+  );
+};
+
+// --- 1. LANDING PAGE (PRE-AUTH) ---
+
+const LandingPage = ({ onNavigate }) => {
+  return (
+    <div className="min-h-screen flex flex-col justify-center items-center p-4 bg-gradient-to-br from-indigo-900 to-teal-600 text-white"
+        style={{ backgroundColor: PRIMARY_NAVY }}>
+      <div className="text-center bg-black/30 p-8 rounded-2xl max-w-lg w-full shadow-2xl">
+        <h1 className="text-5xl font-extrabold mb-2 tracking-tight">
+          Grow Wealth Investment
+        </h1>
+        <p className="text-xl font-light mb-10 text-gray-200">
+          Grow Your Wealth, Secure Your Future
+        </p>
+
+        <div className="space-y-4">
+          <button
+            onClick={() => onNavigate('Login')}
+            className="w-full bg-white text-gray-900 font-bold py-3 px-6 rounded-xl shadow-lg hover:bg-gray-100 transition duration-300 transform hover:scale-[1.02]"
+          >
+            Login
+          </button>
+          <button
+            onClick={() => onNavigate('Register')}
+            className={`w-full bg-emerald-500 text-white font-bold py-3 px-6 rounded-xl shadow-lg hover:bg-emerald-600 transition duration-300 transform hover:scale-[1.02]`}
+            style={{ backgroundColor: SECONDARY_GREEN }}
+          >
+            Register
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- AUTH FORMS SIMULATION (SIMPLIFIED) ---
+
+const AuthForm = ({ type, onNavigate, auth, db, referredByCode = null }) => {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+
+    // SIMULATION: In a real app, this would be a server API call.
+    // Since we are using an anonymous token, we just need to ensure the user profile is set.
+
+    if (type === 'Register') {
+        const userDocRef = doc(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'profile', 'data');
+        const userData = {
+            fullName,
+            email,
+            walletBalance: 0,
+            referralBonus: 0,
+            lastCheckIn: 0,
+            referralCode: auth.currentUser.uid.substring(0, 8),
+            referredBy: referredByCode, // Store referrer ID
+            createdAt: serverTimestamp(),
+        };
+        try {
+            await setDoc(userDocRef, userData, { merge: true });
+            alert('Registration complete! Redirecting to dashboard.');
+            onNavigate('Dashboard');
+        } catch (err) {
+            setError('Registration failed. Try again.');
+            console.error(err);
+        }
+    } else if (type === 'Login') {
+      // Since we only have one logged-in state (via token), any action acts as 'login'
+      // to the persistent user session. We rely on the initial token being active.
+      onNavigate('Dashboard');
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center p-4 bg-gray-50">
+      <div className="w-full max-w-md bg-white p-8 rounded-2xl shadow-xl">
+        <h2 className="text-3xl font-bold mb-6 text-center" style={{ color: PRIMARY_NAVY }}>
+          {type}
+        </h2>
+        {referredByCode && (
+            <p className="text-sm text-center text-emerald-600 mb-4">
+                You were referred by: <span className="font-semibold">{referredByCode}</span>
+            </p>
+        )}
+        <form onSubmit={handleSubmit} className="space-y-4">
+          {type === 'Register' && (
+            <div className="space-y-1">
+              <label htmlFor="fullName" className="text-sm font-medium text-gray-700">Full Name</label>
+              <input
+                id="fullName"
+                type="text"
+                value={fullName}
+                onChange={(e) => setFullName(e.target.value)}
+                className="w-full p-3 border border-gray-300 rounded-lg bg-white text-gray-900 focus:ring-emerald-500 focus:border-emerald-500"
+                required
+              />
+            </div>
+          )}
+          <div className="space-y-1">
+            <label htmlFor="email" className="text-sm font-medium text-gray-700">Email or Phone</label>
+            <input
+              id="email"
+              type="text"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              className="w-full p-3 border border-gray-300 rounded-lg bg-white text-gray-900 focus:ring-emerald-500 focus:border-emerald-500"
+              required
+            />
+          </div>
+          <div className="space-y-1">
+            <label htmlFor="password" className="text-sm font-medium text-gray-700">Password</label>
+            <input
+              id="password"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="w-full p-3 border border-gray-300 rounded-lg bg-white text-gray-900 focus:ring-emerald-500 focus:border-emerald-500"
+              required
+            />
+          </div>
+          {error && <p className="text-red-500 text-sm">{error}</p>}
+          <button
+            type="submit"
+            className={`w-full font-bold py-3 px-4 rounded-xl shadow-lg transition duration-300 ${loading ? 'bg-gray-400' : 'bg-emerald-500 hover:bg-emerald-600 text-white'}`}
+            style={{ backgroundColor: loading ? '#ccc' : SECONDARY_GREEN }}
+            disabled={loading}
+          >
+            {loading ? 'Processing...' : type}
+          </button>
+          <button
+            type="button"
+            onClick={() => onNavigate(type === 'Login' ? 'Register' : 'Login')}
+            className="w-full text-center text-sm mt-3 text-gray-600 hover:text-gray-900 transition"
+          >
+            {type === 'Login' ? "Need an account? Register" : "Already have an account? Login"}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+// --- 2. DASHBOARD (POST-LOGIN) ---
+
+const Dashboard = ({ onNavigate, userData, investments, transactions, dailyCheckIn }) => {
+  const totalBalance = userData.walletBalance + userData.referralBonus;
+  const activeInvestments = investments.filter(inv => inv.status === 'active');
+  const lastFiveTransactions = transactions.slice(0, 5);
+
+  return (
+    <div className="p-4 sm:p-6 lg:p-8 space-y-8 max-w-6xl mx-auto">
+      <h2 className="text-3xl font-bold" style={{ color: PRIMARY_NAVY }}>Dashboard</h2>
+
+      {/* Wallet Summary */}
+      <div className="bg-white p-6 rounded-2xl shadow-xl border-t-4" style={{ borderColor: SECONDARY_GREEN }}>
+        <h3 className="text-xl font-semibold text-gray-700 mb-4 flex justify-between items-center">
+          <WalletIcon className="w-6 h-6 mr-2 text-emerald-500" />
+          Total Wallet Balance
+        </h3>
+        <p className="text-4xl font-extrabold" style={{ color: PRIMARY_NAVY }}>
+          {formatNaira(totalBalance)}
+        </p>
+        <div className="mt-4 flex space-x-6 text-sm">
+          <p className="text-gray-600">
+            <span className="font-medium text-gray-800">Main:</span> {formatNaira(userData.walletBalance)}
+          </p>
+          <p className="text-gray-600">
+            <span className="font-medium text-gray-800">Bonus:</span> {formatNaira(userData.referralBonus)}
+          </p>
+        </div>
+        <div className="mt-6 flex flex-wrap gap-3">
+          <button onClick={() => onNavigate('Deposit')} className="flex-1 min-w-[120px] bg-indigo-500 text-white py-3 rounded-xl font-semibold hover:bg-indigo-600 transition">
+            Deposit <DepositIcon className="w-4 h-4 inline ml-1" />
+          </button>
+          <button onClick={() => onNavigate('Withdraw')} className="flex-1 min-w-[120px] bg-red-500 text-white py-3 rounded-xl font-semibold hover:bg-red-600 transition">
+            Withdraw <WithdrawIcon className="w-4 h-4 inline ml-1" />
+          </button>
+          <button onClick={dailyCheckIn} className={`flex-1 min-w-[120px] py-3 rounded-xl font-semibold transition ${Date.now() - userData.lastCheckIn < 86400000 ? 'bg-gray-400 text-gray-700 cursor-not-allowed' : 'bg-yellow-500 text-white hover:bg-yellow-600'}`}
+            disabled={Date.now() - userData.lastCheckIn < 86400000}
+          >
+            Daily Check-In <CheckInIcon className="w-4 h-4 inline ml-1" />
+          </button>
+        </div>
+      </div>
+
+      {/* Active Investments */}
+      <div className="bg-white p-6 rounded-2xl shadow-xl">
+        <h3 className="text-xl font-semibold text-gray-700 mb-4">Active Investments ({activeInvestments.length})</h3>
+        {activeInvestments.length === 0 ? (
+          <div className="text-center py-6 text-gray-500">
+            <p>You have no active investments.</p>
+            <button onClick={() => onNavigate('Plans')} className={`mt-3 text-sm font-semibold p-2 rounded-lg text-white`} style={{ backgroundColor: SECONDARY_GREEN }}>
+              View Investment Plans
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {activeInvestments.map(inv => <InvestmentCard key={inv.id} investment={inv} />)}
+          </div>
+        )}
+      </div>
+
+      {/* Quick Links & Activity */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+        {/* Activity Feed */}
+        <div className="bg-white p-6 rounded-2xl shadow-xl">
+          <h3 className="text-xl font-semibold text-gray-700 mb-4">Recent Activity</h3>
+          <div className="space-y-3">
+            {lastFiveTransactions.length > 0 ? lastFiveTransactions.map(tx => (
+              <div key={tx.id} className="flex justify-between items-center text-sm p-3 bg-gray-50 rounded-lg">
+                <span className="font-medium capitalize text-gray-800">
+                  {tx.type.replace('_', ' ')}
+                </span>
+                <span className={`font-semibold ${tx.amount > 0 ? 'text-emerald-600' : 'text-red-500'}`}>
+                  {formatNaira(tx.amount)}
+                </span>
+              </div>
+            )) : <p className="text-gray-500">No recent transactions.</p>}
+          </div>
+          <button onClick={() => onNavigate('Transactions')} className="w-full mt-4 text-center text-sm text-gray-600 hover:text-gray-900 transition font-medium">
+            View All Transactions
+          </button>
+        </div>
+
+        {/* Referral Status */}
+        <div className="bg-white p-6 rounded-2xl shadow-xl">
+          <h3 className="text-xl font-semibold text-gray-700 mb-4 flex items-center">
+            <ReferralIcon className="w-5 h-5 mr-2 text-indigo-500" />
+            Referral Summary
+          </h3>
+          <p className="text-3xl font-bold" style={{ color: PRIMARY_NAVY }}>
+            {formatNaira(userData.referralBonus)}
+          </p>
+          <p className="text-sm text-gray-600 mt-1">
+            Total Earned Referral Bonus
+          </p>
+          <button onClick={() => onNavigate('Referral')} className={`mt-4 w-full text-center text-white py-2 rounded-xl font-semibold`} style={{ backgroundColor: PRIMARY_NAVY }}>
+            Manage Referrals
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const InvestmentCard = ({ investment }) => {
+  const { amount, expectedPayout, startedAt, endsAt, planName } = investment;
+  const totalDuration = endsAt.getTime() - startedAt.getTime();
+  const elapsed = Date.now() - startedAt.getTime();
+  const progressPercent = Math.min(100, (elapsed / totalDuration) * 100);
+
+  const timeLeft = endsAt.getTime() - Date.now();
+  const days = Math.floor(timeLeft / (1000 * 60 * 60 * 24));
+  const hours = Math.floor((timeLeft % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+  const minutes = Math.floor((timeLeft % (1000 * 60 * 60)) / (1000 * 60));
+
+  return (
+    <div className="border border-gray-200 p-4 rounded-xl shadow-sm hover:shadow-md transition duration-300">
+      <div className="flex justify-between items-start mb-2">
+        <div>
+          <h4 className="font-bold text-lg text-gray-900">{planName}</h4>
+          <p className="text-xs text-gray-500">Started: {startedAt.toLocaleDateString()}</p>
+        </div>
+        <span className={`px-3 py-1 text-xs font-semibold rounded-full ${investment.status === 'active' ? 'bg-yellow-100 text-yellow-800' : 'bg-emerald-100 text-emerald-800'}`}>
+          {investment.status.toUpperCase()}
+        </span>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 text-sm text-gray-700 mb-3">
+        <div>
+          <span className="font-medium">Invested:</span> {formatNaira(amount)}
+        </div>
+        <div>
+          <span className="font-medium">Expected Payout:</span> {formatNaira(expectedPayout)}
+        </div>
+      </div>
+
+      <div className="mt-3">
+        <div className="w-full bg-gray-200 rounded-full h-2.5">
+          <div
+            className="h-2.5 rounded-full"
+            style={{ width: `${progressPercent}%`, backgroundColor: SECONDARY_GREEN }}
+          ></div>
+        </div>
+        <div className="flex justify-between text-xs mt-1 text-gray-500">
+          <span>Progress: {Math.round(progressPercent)}%</span>
+          {investment.status === 'active' && timeLeft > 0 ? (
+            <span className="font-medium text-indigo-600">
+              Matures in: {days}D {hours}H {minutes}M
+            </span>
+          ) : (
+            <span className="font-medium text-emerald-600">
+              Payout Ready
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+
+// --- 3. INVESTMENT PLANS ---
+
+const InvestmentPlans = ({ onNavigate, userId, db, userData }) => {
+  const [selectedPlan, setSelectedPlan] = useState(null);
+  const [showConfirm, setShowConfirm] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+
+  const handleInvestClick = (plan) => {
+    setSelectedPlan(plan);
+    setShowConfirm(true);
+  };
+
+  const confirmInvestment = async () => {
+    if (!selectedPlan || isProcessing) return;
+
+    if (userData.walletBalance < selectedPlan.investAmount) {
+      alert(`Insufficient funds! You need ${formatNaira(selectedPlan.investAmount)} but only have ${formatNaira(userData.walletBalance)}.`);
+      return onNavigate('Deposit');
+    }
+
+    setIsProcessing(true);
+    const success = await executeInvestmentTransaction(selectedPlan, userId, db, userData.walletBalance);
+
+    if (success) {
+      alert(`Successfully invested ${formatNaira(selectedPlan.investAmount)} in ${selectedPlan.name}!`);
+    }
+
+    setShowConfirm(false);
+    setIsProcessing(false);
+    onNavigate('Dashboard');
+  };
+
+  return (
+    <div className="p-4 sm:p-6 lg:p-8 max-w-6xl mx-auto">
+      <h2 className="text-3xl font-bold mb-8" style={{ color: PRIMARY_NAVY }}>Investment Machines</h2>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+        {INVESTMENT_PLANS.map(plan => (
+          <div key={plan.id} className="bg-white p-6 rounded-2xl shadow-xl border-t-4 hover:shadow-2xl transition duration-300 transform hover:scale-[1.01]" style={{ borderColor: SECONDARY_GREEN }}>
+            <div className="text-4xl mb-4">{plan.icon}</div>
+            <h3 className="text-2xl font-bold mb-2" style={{ color: PRIMARY_NAVY }}>{plan.name}</h3>
+            <p className="text-lg font-medium text-gray-600 mb-4">Duration: {plan.durationDays} Days</p>
+
+            <div className="mb-4">
+              <p className="text-sm text-gray-500">Invest Amount</p>
+              <p className="text-3xl font-extrabold text-indigo-600">{formatNaira(plan.investAmount)}</p>
+            </div>
+            <div className="mb-6">
+              <p className="text-sm text-gray-500">Expected Payout</p>
+              <p className="text-3xl font-extrabold" style={{ color: SECONDARY_GREEN }}>{formatNaira(plan.payoutAmount)}</p>
+            </div>
+
+            <button
+              onClick={() => handleInvestClick(plan)}
+              className="w-full py-3 font-semibold rounded-xl text-white hover:opacity-90 transition duration-300"
+              style={{ backgroundColor: PRIMARY_NAVY }}
+            >
+              Invest / Join Now
+            </button>
+          </div>
+        ))}
+      </div>
+
+      {/* Confirmation Modal */}
+      {showConfirm && selectedPlan && (
+        <Modal onClose={() => setShowConfirm(false)}>
+          <h3 className="text-2xl font-bold mb-4" style={{ color: PRIMARY_NAVY }}>Confirm Investment</h3>
+          <p className="text-gray-700 mb-6">
+            You are about to invest <span className="font-bold text-indigo-600">{formatNaira(selectedPlan.investAmount)}</span> in <span className="font-bold">{selectedPlan.name}</span>. Your expected return is <span className="font-bold" style={{ color: SECONDARY_GREEN }}>{formatNaira(selectedPlan.payoutAmount)}</span> after {selectedPlan.durationDays} days.
+          </p>
+          <div className="flex justify-end space-x-3">
+            <button onClick={() => setShowConfirm(false)} className="px-4 py-2 border rounded-xl text-gray-600 hover:bg-gray-100">
+              Cancel
+            </button>
+            <button
+              onClick={confirmInvestment}
+              disabled={isProcessing}
+              className={`px-4 py-2 font-semibold rounded-xl text-white ${isProcessing ? 'bg-gray-400' : 'bg-emerald-500 hover:bg-emerald-600'}`}
+              style={{ backgroundColor: isProcessing ? '#ccc' : SECONDARY_GREEN }}
+            >
+              {isProcessing ? 'Investing...' : 'Confirm & Invest'}
+            </button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+};
+
+// --- 4. DEPOSIT MODAL ---
+
+const DepositModal = ({ onClose, userId, db }) => {
+  const [amount, setAmount] = useState(5000);
+  const [depositType, setDepositType] = useState('paystack'); // 'paystack' or 'manual'
+  const [proofFile, setProofFile] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (amount < 1000) return alert('Minimum deposit amount is ₦1,000.');
+
+    setLoading(true);
+
+    const transactionsColRef = collection(db, 'artifacts', appId, 'users', userId, 'transactions');
+    const depositRef = doc(db, 'artifacts', appId, 'users', userId, 'manualDeposits', `MANUAL-${Date.now()}`); // Separate collection for admin review
+
+    try {
+      if (depositType === 'paystack') {
+        // SIMULATION: Paystack flow (instant credit)
+        // In a real app, this initializes Paystack and waits for webhook confirmation.
+        await runTransaction(db, async (transaction) => {
+            const userDocRef = doc(db, 'artifacts', appId, 'users', userId, 'profile', 'data');
+            const userDoc = await transaction.get(userDocRef);
+            const currentBalance = userDoc.data().walletBalance || 0;
+
+            // 1. Credit Wallet
+            transaction.update(userDocRef, { walletBalance: currentBalance + amount });
+
+            // 2. Create Transaction Record
+            await setDoc(doc(transactionsColRef), {
+                userId: userId,
+                type: 'deposit_paystack',
+                amount: amount,
+                status: 'completed',
+                reference: `PYSK-${Date.now()}`,
+                description: 'Paystack Instant Deposit',
+                created_at: serverTimestamp(),
+            });
+        });
+        alert(`Successfully deposited ${formatNaira(amount)}. Your wallet has been credited (Simulated).`);
+
+      } else {
+        // MANUAL DEPOSIT
+        if (!proofFile) return alert('Please upload proof of payment for manual deposit.');
+
+        await setDoc(depositRef, {
+            userId: userId,
+            amount: amount,
+            status: 'pending',
+            proofUrl: 'SIMULATED_URL_' + proofFile.name, // Real app requires Firebase Storage upload
+            bankName: 'Kredi Money Mfb Ltd',
+            accountNo: '1879115476',
+            adminNote: '',
+            created_at: serverTimestamp(),
+        });
+        alert(`Manual deposit request for ${formatNaira(amount)} submitted. It will be credited after admin approval.`);
+      }
+
+      onClose();
+    } catch (e) {
+      console.error("Deposit failed:", e);
+      alert('An error occurred during deposit.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Modal onClose={onClose} title="Deposit Funds">
+      <form onSubmit={handleSubmit} className="space-y-6">
+        <div className="space-y-1">
+          <label className="text-sm font-medium text-gray-700">Amount (₦)</label>
+          <input
+            type="number"
+            min="1000"
+            step="1000"
+            value={amount}
+            onChange={(e) => setAmount(Number(e.target.value))}
+            className="w-full p-3 border border-gray-300 rounded-lg bg-white text-gray-900 focus:ring-emerald-500 focus:border-emerald-500 text-lg font-semibold"
+            required
+          />
+        </div>
+
+        <div>
+          <label className="text-sm font-medium text-gray-700 block mb-2">Deposit Method</label>
+          <div className="flex space-x-4">
+            <button
+              type="button"
+              onClick={() => setDepositType('paystack')}
+              className={`flex-1 p-3 rounded-xl border-2 font-semibold transition ${depositType === 'paystack' ? 'border-emerald-500 bg-emerald-50 text-emerald-800' : 'border-gray-300 bg-white text-gray-700'}`}
+            >
+              Paystack (Card/Bank)
+            </button>
+            <button
+              type="button"
+              onClick={() => setDepositType('manual')}
+              className={`flex-1 p-3 rounded-xl border-2 font-semibold transition ${depositType === 'manual' ? 'border-emerald-500 bg-emerald-50 text-emerald-800' : 'border-gray-300 bg-white text-gray-700'}`}
+            >
+              Manual Bank Transfer
+            </button>
+          </div>
+        </div>
+
+        {depositType === 'manual' && (
+          <div className="bg-yellow-50 p-4 rounded-xl border-l-4 border-yellow-500 space-y-3">
+            <p className="font-semibold text-yellow-800">
+              Manual Deposit Note:
+            </p>
+            <p className="text-sm text-yellow-800">
+              To deposit manually, transfer to: <span className="font-bold">1879115476 — Kredi Money Mfb Ltd.</span> Upload proof and we’ll verify within 1 business day.
+            </p>
+            <div className="space-y-1">
+              <label htmlFor="proof" className="text-sm font-medium text-gray-700">Upload Payment Proof (Screenshot)</label>
+              <input
+                id="proof"
+                type="file"
+                onChange={(e) => setProofFile(e.target.files[0])}
+                className="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-emerald-50 file:text-emerald-700 hover:file:bg-emerald-100"
+                required
+              />
+            </div>
+          </div>
+        )}
+
+        <button
+          type="submit"
+          className={`w-full font-bold py-3 px-4 rounded-xl shadow-lg transition duration-300 text-white ${loading ? 'bg-gray-400' : 'hover:opacity-90'}`}
+          style={{ backgroundColor: loading ? '#ccc' : PRIMARY_NAVY }}
+          disabled={loading}
+        >
+          {loading ? 'Processing...' : (depositType === 'paystack' ? 'Initialize Paystack Payment' : 'Submit Manual Deposit Request')}
+        </button>
+      </form>
+    </Modal>
+  );
+};
+
+// --- 5. WITHDRAWAL MODAL ---
+
+const WithdrawalModal = ({ onClose, userId, db, walletBalance }) => {
+  const [amount, setAmount] = useState(1000);
+  const [bankName, setBankName] = setBankName('');
+  const [accountNo, setAccountNo] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (amount > walletBalance) return alert('Withdrawal amount exceeds main wallet balance.');
+    if (amount < 1000) return alert('Minimum withdrawal amount is ₦1,000.');
+    if (bankName.length < 3 || accountNo.length < 10) return alert('Please provide valid bank details.');
+
+    setLoading(true);
+
+    const transactionsColRef = collection(db, 'artifacts', appId, 'users', userId, 'transactions');
+    const userDocRef = doc(db, 'artifacts', appId, 'users', userId, 'profile', 'data');
+
+    try {
+      await runTransaction(db, async (transaction) => {
+        const userDoc = await transaction.get(userDocRef);
+        const currentBalance = userDoc.data().walletBalance || 0;
+
+        if (currentBalance < amount) {
+          throw "Insufficient balance during withdrawal transaction check.";
+        }
+
+        // 1. Debit Wallet
+        transaction.update(userDocRef, { walletBalance: currentBalance - amount });
+
+        // 2. Create Withdrawal Transaction Record (Status: Pending)
+        await setDoc(doc(transactionsColRef), {
+          userId: userId,
+          type: 'withdraw_request',
+          amount: -amount, // Negative for debit
+          status: 'pending_admin',
+          reference: `WDRW-${Date.now()}`,
+          bankName,
+          accountNo,
+          description: 'Withdrawal request submitted',
+          created_at: serverTimestamp(),
+        });
+      });
+
+      alert(`Withdrawal request for ${formatNaira(amount)} submitted successfully. It is now pending admin approval.`);
+      onClose();
+    } catch (e) {
+      console.error("Withdrawal request failed:", e);
+      alert(`Withdrawal failed: ${e.message || 'An unexpected error occurred.'}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Modal onClose={onClose} title="Request Withdrawal">
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <p className="text-sm text-gray-600">
+          Main Wallet Balance: <span className="font-bold text-lg" style={{ color: SECONDARY_GREEN }}>{formatNaira(walletBalance)}</span>
+        </p>
+
+        <div className="space-y-1">
+          <label htmlFor="amount" className="text-sm font-medium text-gray-700">Amount to Withdraw (₦)</label>
+          <input
+            id="amount"
+            type="number"
+            min="1000"
+            max={walletBalance}
+            step="100"
+            value={amount}
+            onChange={(e) => setAmount(Number(e.target.value))}
+            className="w-full p-3 border border-gray-300 rounded-lg bg-white text-gray-900 focus:ring-emerald-500 focus:border-emerald-500"
+            required
+          />
+        </div>
+
+        <div className="space-y-1">
+          <label htmlFor="bankName" className="text-sm font-medium text-gray-700">Bank Name</label>
+          <input
+            id="bankName"
+            type="text"
+            value={bankName}
+            onChange={(e) => setBankName(e.target.value)}
+            placeholder="e.g., Zenith Bank"
+            className="w-full p-3 border border-gray-300 rounded-lg bg-white text-gray-900 focus:ring-emerald-500 focus:border-emerald-500"
+            required
+          />
+        </div>
+
+        <div className="space-y-1">
+          <label htmlFor="accountNo" className="text-sm font-medium text-gray-700">Account Number</label>
+          <input
+            id="accountNo"
+            type="text"
+            value={accountNo}
+            onChange={(e) => setAccountNo(e.target.value)}
+            placeholder="10 digit account number"
+            className="w-full p-3 border border-gray-300 rounded-lg bg-white text-gray-900 focus:ring-emerald-500 focus:border-emerald-500"
+            required
+          />
+        </div>
+
+        <button
+          type="submit"
+          className={`w-full font-bold py-3 px-4 rounded-xl shadow-lg transition duration-300 text-white ${loading ? 'bg-gray-400' : 'bg-emerald-500 hover:bg-emerald-600'}`}
+          style={{ backgroundColor: loading ? '#ccc' : SECONDARY_GREEN }}
+          disabled={loading || amount > walletBalance}
+        >
+          {loading ? 'Submitting...' : 'Request Withdrawal'}
+        </button>
+      </form>
+    </Modal>
+  );
+};
+
+// --- 6. REFERRAL SECTION ---
+
+const ReferralSection = ({ userData, transactions }) => {
+  const referralLink = `${window.location.origin}/r/${userData.referralCode}`;
+  const referralTransactions = useMemo(() => {
+      return transactions.filter(tx => tx.type === 'referral_credit');
+  }, [transactions]);
+
+  const handleCopy = () => {
+    // Fallback for secure context copy
+    const el = document.createElement('textarea');
+    el.value = referralLink;
+    document.body.appendChild(el);
+    el.select();
+    document.execCommand('copy');
+    document.body.removeChild(el);
+    alert('Referral link copied to clipboard!');
+  };
+
+  return (
+    <div className="p-4 sm:p-6 lg:p-8 max-w-6xl mx-auto">
+      <h2 className="text-3xl font-bold mb-8" style={{ color: PRIMARY_NAVY }}>Referral Program</h2>
+
+      <div className="bg-white p-6 rounded-2xl shadow-xl space-y-6">
+        <div className="text-center">
+          <h3 className="text-xl font-semibold text-gray-700">Your Unique Referral Link</h3>
+          <div className="mt-3 flex flex-col sm:flex-row items-center justify-center space-y-3 sm:space-y-0 sm:space-x-3">
+            <input
+              type="text"
+              readOnly
+              value={referralLink}
+              className="w-full sm:max-w-lg p-3 border border-gray-300 rounded-lg bg-gray-100 text-gray-800 text-sm"
+            />
+            <button
+              onClick={handleCopy}
+              className={`px-4 py-3 font-semibold rounded-xl text-white transition duration-300 whitespace-nowrap`}
+              style={{ backgroundColor: SECONDARY_GREEN }}
+            >
+              Copy Link
+            </button>
+          </div>
+          <p className="mt-4 text-gray-500 text-sm">
+            Earn <span className="font-bold text-emerald-600">₦3,000</span> when your referred friend registers and makes their first successful investment.
+          </p>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-4 border-t border-gray-100">
+          <div className="p-4 bg-indigo-50 rounded-xl">
+            <p className="text-sm font-medium text-indigo-700">Your Referral Code</p>
+            <p className="text-2xl font-bold text-indigo-900">{userData.referralCode}</p>
+          </div>
+          <div className="p-4 bg-emerald-50 rounded-xl">
+            <p className="text-sm font-medium text-emerald-700">Total Referral Bonus Earned</p>
+            <p className="text-2xl font-bold text-emerald-900">{formatNaira(userData.referralBonus)}</p>
+          </div>
+        </div>
+
+        {/* Referral Log (simplified by showing credited transactions) */}
+        <div className="pt-4 border-t border-gray-100">
+            <h3 className="text-xl font-semibold text-gray-700 mb-4">Credited Bonuses ({referralTransactions.length})</h3>
+            <div className="space-y-3 max-h-60 overflow-y-auto">
+                {referralTransactions.length > 0 ? referralTransactions.map(tx => (
+                    <div key={tx.id} className="flex justify-between items-center text-sm p-3 bg-gray-50 rounded-lg">
+                        <span className="font-medium text-gray-800">
+                            {tx.description}
+                        </span>
+                        <span className="font-semibold text-emerald-600">
+                            +{formatNaira(tx.amount)}
+                        </span>
+                    </div>
+                )) : <p className="text-gray-500 text-center">No bonuses credited yet.</p>}
+            </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- 7. TRANSACTIONS/ACTIVITY FEED ---
+
+const ActivityFeed = ({ transactions }) => {
+    return (
+        <div className="p-4 sm:p-6 lg:p-8 max-w-4xl mx-auto">
+            <h2 className="text-3xl font-bold mb-6" style={{ color: PRIMARY_NAVY }}>Activity Feed</h2>
+
+            <div className="bg-white p-6 rounded-2xl shadow-xl">
+                <div className="space-y-4">
+                    {transactions.length > 0 ? transactions.map(tx => {
+                        const isCredit = tx.amount > 0;
+                        const amountText = isCredit ? `+${formatNaira(tx.amount)}` : formatNaira(tx.amount);
+                        const amountColor = isCredit ? 'text-emerald-600' : 'text-red-500';
+                        const statusColor = tx.status === 'completed' ? 'bg-emerald-100 text-emerald-800' : 'bg-yellow-100 text-yellow-800';
+
+                        return (
+                            <div key={tx.id} className="flex flex-col sm:flex-row justify-between items-start sm:items-center p-4 border-b border-gray-100 last:border-b-0">
+                                <div>
+                                    <p className="font-semibold text-gray-900 capitalize">{tx.type.replace('_', ' ')}</p>
+                                    <p className="text-xs text-gray-500">{tx.description}</p>
+                                    <span className={`mt-1 inline-block px-2 py-0.5 text-xs font-medium rounded-full ${statusColor}`}>
+                                        {tx.status.toUpperCase().replace('_', ' ')}
+                                    </span>
+                                </div>
+                                <div className="text-right mt-2 sm:mt-0">
+                                    <p className={`font-bold ${amountColor}`}>{amountText}</p>
+                                    <p className="text-xs text-gray-500">{tx.created_at?.toLocaleDateString()}</p>
+                                </div>
+                            </div>
+                        );
+                    }) : (
+                        <p className="text-gray-500 text-center py-8">No transactions recorded yet.</p>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+};
+
+// --- 8. GLOBAL MODAL COMPONENT ---
+
+const Modal = ({ children, onClose, title }) => (
+  <div className="fixed inset-0 z-[100] bg-black bg-opacity-50 flex items-center justify-center p-4">
+    <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto transform scale-100 transition-transform duration-300">
+      <div className="p-6 border-b flex justify-between items-center">
+        <h3 className="text-xl font-bold" style={{ color: PRIMARY_NAVY }}>{title}</h3>
+        <button onClick={onClose} className="text-gray-500 hover:text-gray-700 text-2xl">
+          &times;
+        </button>
+      </div>
+      <div className="p-6">
+        {children}
+      </div>
+    </div>
+  </div>
+);
+
+// --- MAIN APPLICATION COMPONENT ---
+
+const App = () => {
+  const { authState, db, auth } = useFirebaseAndAuth();
+  const { userId, isAuthenticated, loading: authLoading } = authState;
+
+  // URL parsing for referral links
+  const urlPath = window.location.pathname;
+  const isReferralPage = urlPath.startsWith('/r/');
+  const referredByCode = isReferralPage ? urlPath.substring(3) : null;
+
+  const [currentView, setCurrentView] = useState('Landing'); // Landing, Login, Register, Dashboard, Plans, Deposit, Withdraw, Referral, Transactions
+
+  // Load persistent user data
+  const { userData, investments, transactions, loadingData } = useUserData(userId, db);
+
+  // Simulate server-side cron job for payouts
+  useInvestmentPayouts(userId, db, investments);
+
+  // Redirect logic once auth state is known
+  useEffect(() => {
+    if (authLoading) return;
+    if (isAuthenticated) {
+      setCurrentView('Dashboard');
+    } else if (currentView !== 'Login' && currentView !== 'Register' && !isReferralPage) {
+      setCurrentView('Landing');
+    }
+    // If it's a referral link, navigate to register
+    if (!isAuthenticated && isReferralPage) {
+        setCurrentView('Register');
+    }
+  }, [isAuthenticated, authLoading, isReferralPage]);
+
+  // Handle Daily Check-In
+  const handleDailyCheckIn = useCallback(async () => {
+    if (!userId || !db) return;
+    const now = Date.now();
+    const oneDay = 86400000; // 24 hours in milliseconds
+
+    if (now - userData.lastCheckIn < oneDay) {
+      alert("You have already checked in today. Try again tomorrow!");
+      return;
+    }
+
+    const BONUS_AMOUNT = 100;
+    const userDocRef = doc(db, 'artifacts', appId, 'users', userId, 'profile', 'data');
+    const transactionsColRef = collection(db, 'artifacts', appId, 'users', userId, 'transactions');
+
+    try {
+        await runTransaction(db, async (transaction) => {
+            const userDoc = await transaction.get(userDocRef);
+            const currentBalance = userDoc.data().walletBalance || 0;
+
+            // 1. Update Wallet Balance
+            transaction.update(userDocRef, {
+                walletBalance: currentBalance + BONUS_AMOUNT,
+                lastCheckIn: serverTimestamp(),
+            });
+
+            // 2. Create Transaction Record
+            await setDoc(doc(transactionsColRef), {
+                userId: userId,
+                type: 'daily_bonus',
+                amount: BONUS_AMOUNT,
+                status: 'completed',
+                reference: `BONUS-${now}`,
+                description: 'Daily Check-In Bonus',
+                created_at: serverTimestamp(),
+            });
+        });
+        alert(`Daily Check-In successful! ${formatNaira(BONUS_AMOUNT)} credited to your wallet.`);
+    } catch (e) {
+        console.error("Daily check-in transaction failed:", e);
+        alert('Daily check-in failed. Please try again.');
+    }
+
+  }, [userId, db, userData.lastCheckIn]);
+
+  const navigate = (view) => {
+    setCurrentView(view);
+    // Clear URL path on navigation if it's a referral path
+    if (isReferralPage) {
+        window.history.pushState({}, '', '/');
+    }
+  };
+
+
+  // Show loading state if auth or core user data is loading
+  if (authLoading || (isAuthenticated && loadingData)) {
+    return (
+      <div className="flex items-center justify-center min-h-screen" style={{ backgroundColor: PRIMARY_NAVY, color: 'white' }}>
+        <p className="text-lg animate-pulse">Loading Grow Wealth Investment...</p>
+      </div>
+    );
+  }
+
+  // --- RENDER LOGIC ---
+
+  let PageComponent;
+  let showHeader = true;
+
+  if (!isAuthenticated && currentView === 'Landing') {
+    PageComponent = <LandingPage onNavigate={navigate} />;
+    showHeader = false;
+  } else if (!isAuthenticated && currentView === 'Login') {
+    PageComponent = <AuthForm type="Login" onNavigate={navigate} auth={auth} db={db} />;
+    showHeader = false;
+  } else if (!isAuthenticated && currentView === 'Register') {
+    PageComponent = <AuthForm type="Register" onNavigate={navigate} auth={auth} db={db} referredByCode={referredByCode} />;
+    showHeader = false;
+  } else if (isAuthenticated) {
+    switch (currentView) {
+      case 'Plans':
+        PageComponent = <InvestmentPlans onNavigate={navigate} userId={userId} db={db} userData={userData} />;
+        break;
+      case 'Referral':
+        PageComponent = <ReferralSection userData={userData} transactions={transactions} />;
+        break;
+      case 'Transactions':
+        PageComponent = <ActivityFeed transactions={transactions} />;
+        break;
+      case 'Dashboard':
+      default:
+        PageComponent = <Dashboard
+          onNavigate={navigate}
+          userData={userData}
+          investments={investments}
+          transactions={transactions}
+          dailyCheckIn={handleDailyCheckIn}
+        />;
+        break;
+    }
+  } else {
+    // Fallback to landing if somehow unauthenticated and not on auth page
+    PageComponent = <LandingPage onNavigate={navigate} />;
+    showHeader = false;
+  }
+
+  // Determine if a modal should be shown
+  let ModalComponent = null;
+  if (currentView === 'Deposit') {
+    ModalComponent = <DepositModal onClose={() => setCurrentView('Dashboard')} userId={userId} db={db} />;
+  } else if (currentView === 'Withdraw') {
+    ModalComponent = <WithdrawalModal onClose={() => setCurrentView('Dashboard')} userId={userId} db={db} walletBalance={userData.walletBalance} />;
+  }
+
+
+  return (
+    <div className="min-h-screen bg-gray-50 font-sans">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .bg-navy { background-color: ${PRIMARY_NAVY}; }
+        .text-navy { color: ${PRIMARY_NAVY}; }
+      `}</style>
+      {/* Global Header/Navbar */}
+      {showHeader && (
+        <Header
+          onNavigate={navigate}
+          isAuthenticated={isAuthenticated}
+          fullName={userData.fullName || 'Grow Wealth User'}
+        />
+      )}
+
+      {/* Main Content */}
+      <main className={showHeader ? 'pt-0' : ''}>
+        {PageComponent}
+      </main>
+
+      {/* Modals */}
+      {ModalComponent}
+
+      {/* Footer / Contact (Always Visible) */}
+      <footer className="bg-navy text-white p-6 mt-12">
+        <div className="max-w-6xl mx-auto flex flex-col md:flex-row justify-between items-center text-center md:text-left">
+            <p>&copy; {new Date().getFullYear()} Grow Wealth Investment. All Rights Reserved.</p>
+            <div className="mt-4 md:mt-0 space-x-4 text-sm">
+                <a href="https://wa.me/2349134390396" target="_blank" className="hover:text-emerald-400 transition">WhatsApp: +2349134390396</a>
+                <a href="mailto:aaboy.org@gmail.com" className="hover:text-emerald-400 transition">Email: aaboy.org@gmail.com</a>
+            </div>
+        </div>
+      </footer>
+    </div>
+  );
+};
+
+export default App;
